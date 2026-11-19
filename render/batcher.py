@@ -1,4 +1,4 @@
-"""精灵批处理的核心接口（初始为未实现桩）。
+"""精灵批处理的核心接口。
 
 精灵统一使用内联四字段字典::
 
@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 
 # 浮点比较容差。
@@ -24,9 +25,64 @@ EPS = 1e-6
 # merge_compatible 使用的默认硬件顶点上限。
 MAX_VERTICES = 4096
 
+_VALID_BLENDS = ("opaque", "alpha")
+
 
 class BatchError(Exception):
     """批处理输入非法、上限非法或存在无法装入批次的精灵。"""
+
+
+def _validate_sprite(sprite: object, index: object = "?") -> Mapping[str, object]:
+    """校验单个精灵的四字段结构，非法时抛 ``BatchError``。"""
+    if not isinstance(sprite, Mapping):
+        raise BatchError(f"精灵 {index} 不是映射: {sprite!r}")
+    missing = {"texture", "z", "blend", "verts"} - set(sprite)
+    if missing:
+        raise BatchError(f"精灵 {index} 缺少字段: {sorted(missing)}")
+
+    texture = sprite["texture"]
+    try:
+        hash(texture)
+    except TypeError:
+        raise BatchError(f"精灵 {index} 的 texture 不可哈希: {texture!r}") from None
+
+    z = sprite["z"]
+    if (
+        isinstance(z, bool)
+        or not isinstance(z, (int, float))
+        or not math.isfinite(z)
+    ):
+        raise BatchError(f"精灵 {index} 的 z 必须是有限浮点数: {z!r}")
+
+    blend = sprite["blend"]
+    if blend not in _VALID_BLENDS:
+        raise BatchError(f"精灵 {index} 的 blend 非法: {blend!r}")
+
+    verts = sprite["verts"]
+    if isinstance(verts, bool) or not isinstance(verts, int) or verts <= 0:
+        raise BatchError(f"精灵 {index} 的 verts 必须是正整数: {verts!r}")
+
+    return sprite
+
+
+def _validate_sprites(
+    sprites: Sequence[Mapping[str, object]],
+) -> Sequence[Mapping[str, object]]:
+    if isinstance(sprites, (str, bytes)) or not isinstance(sprites, Sequence):
+        raise BatchError(f"sprites 必须是序列: {type(sprites).__name__}")
+    for index, sprite in enumerate(sprites):
+        _validate_sprite(sprite, index)
+    return sprites
+
+
+def _validate_max_vertices(max_vertices: int) -> int:
+    if (
+        isinstance(max_vertices, bool)
+        or not isinstance(max_vertices, int)
+        or max_vertices <= 0
+    ):
+        raise BatchError(f"max_vertices 必须是正整数: {max_vertices!r}")
+    return max_vertices
 
 
 def build_batches(
@@ -43,8 +99,36 @@ def build_batches(
       ``max_vertices`` 时抛 ``BatchError``，不得静默丢弃。
     * 浮点比较使用 ``1e-6`` 容差。
     """
+    _validate_max_vertices(max_vertices)
+    _validate_sprites(sprites)
 
-    raise NotImplementedError("build_batches 尚未实现")
+    # 先整体校验单精灵上限，任何超限都直接报错，不产出半成品。
+    for index, sprite in enumerate(sprites):
+        if sprite["verts"] > max_vertices:
+            raise BatchError(
+                f"精灵 {index} 的 verts={sprite['verts']} 超过上限 {max_vertices}"
+            )
+
+    groups: dict[tuple, list[int]] = {}
+    for index, sprite in enumerate(sprites):
+        key = (sprite["texture"], sprite["blend"])
+        groups.setdefault(key, []).append(index)
+
+    batches: list[list[int]] = []
+    for indices in groups.values():
+        current: list[int] = []
+        current_verts = 0
+        for index in indices:
+            verts = sprites[index]["verts"]
+            if current and current_verts + verts > max_vertices + EPS:
+                batches.append(current)
+                current = []
+                current_verts = 0
+            current.append(index)
+            current_verts += verts
+        if current:
+            batches.append(current)
+    return batches
 
 
 def sort_key(sprite: Mapping[str, object]) -> tuple:
@@ -56,8 +140,11 @@ def sort_key(sprite: Mapping[str, object]) -> tuple:
     key 中加入 id、下标等 tie-breaker。z 必须是有限 float，blend 非法时抛
     ``BatchError``。浮点比较使用 ``1e-6`` 容差。
     """
-
-    raise NotImplementedError("sort_key 尚未实现")
+    _validate_sprite(sprite)
+    z = float(sprite["z"])
+    if sprite["blend"] == "opaque":
+        return (0, z)
+    return (1, -z)
 
 
 def assign_pages(
@@ -75,8 +162,38 @@ def assign_pages(
     * ``page_capacity <= 0`` 或精灵非法时抛 ``BatchError``；累计面积及浮点
       比较使用 ``1e-6`` 容差。
     """
+    if (
+        isinstance(page_capacity, bool)
+        or not isinstance(page_capacity, (int, float))
+        or not math.isfinite(page_capacity)
+        or page_capacity <= 0
+    ):
+        raise BatchError(f"page_capacity 必须是正数: {page_capacity!r}")
+    _validate_sprites(sprites)
 
-    raise NotImplementedError("assign_pages 尚未实现")
+    pages: dict[int, list[int]] = {}
+    overflow: list[int] = []
+    page_id = 0
+    used = 0.0
+    current: list[int] = []
+
+    for index, sprite in enumerate(sprites):
+        area = float(sprite["verts"])
+        if area > page_capacity + EPS:
+            overflow.append(index)
+            continue
+        if current and used + area > page_capacity + EPS:
+            pages[page_id] = current
+            page_id += 1
+            current = []
+            used = 0.0
+        current.append(index)
+        used += area
+
+    if current:
+        pages[page_id] = current
+
+    return {"pages": pages, "overflow": overflow}
 
 
 def merge_compatible(a: Mapping[str, object], b: Mapping[str, object]) -> bool:
@@ -87,8 +204,13 @@ def merge_compatible(a: Mapping[str, object], b: Mapping[str, object]) -> bool:
     本函数不修改输入；z 不参与合并判断。输入非法时抛 ``BatchError``，浮点
     比较使用 ``1e-6`` 容差。
     """
-
-    raise NotImplementedError("merge_compatible 尚未实现")
+    _validate_sprite(a, "a")
+    _validate_sprite(b, "b")
+    if a["texture"] != b["texture"]:
+        return False
+    if a["blend"] != b["blend"]:
+        return False
+    return a["verts"] + b["verts"] <= MAX_VERTICES + EPS
 
 
 def interleave_alpha(groups: Sequence[Mapping[str, object]]) -> list[int]:
@@ -100,14 +222,33 @@ def interleave_alpha(groups: Sequence[Mapping[str, object]]) -> list[int]:
     必须保持不变，从而透明与非透明交错输入时不会出现穿插。空 ``groups``
     返回 ``[]``；blend 非法或组结构非法时抛 ``BatchError``。
     """
+    if isinstance(groups, (str, bytes)) or not isinstance(groups, Sequence):
+        raise BatchError(f"groups 必须是序列: {type(groups).__name__}")
 
-    raise NotImplementedError("interleave_alpha 尚未实现")
+    opaque: list[int] = []
+    alpha: list[int] = []
+    for position, group in enumerate(groups):
+        if not isinstance(group, Mapping) or "blend" not in group or "indices" not in group:
+            raise BatchError(f"组 {position} 结构非法: {group!r}")
+        blend = group["blend"]
+        if blend not in _VALID_BLENDS:
+            raise BatchError(f"组 {position} 的 blend 非法: {blend!r}")
+        indices = group["indices"]
+        if isinstance(indices, (str, bytes)) or not isinstance(indices, Sequence):
+            raise BatchError(f"组 {position} 的 indices 必须是序列: {indices!r}")
+        for item in indices:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise BatchError(f"组 {position} 的索引必须是整数: {item!r}")
+        target = opaque if blend == "opaque" else alpha
+        target.extend(indices)
+    return opaque + alpha
 
 
 def estimate_draws(batches: Sequence[Sequence[int]]) -> int:
     """返回 draw call 数：每个非空批次计一次，空批次不计。"""
-
-    raise NotImplementedError("estimate_draws 尚未实现")
+    if isinstance(batches, (str, bytes)) or not isinstance(batches, Sequence):
+        raise BatchError(f"batches 必须是序列: {type(batches).__name__}")
+    return sum(1 for batch in batches if batch)
 
 
 def split_overflow(
@@ -120,8 +261,8 @@ def split_overflow(
     时立即抛 ``BatchError``，绝不静默丢弃或塞进 ``overflow``。``max_vertices``
     非正或精灵非法同样抛 ``BatchError``。
     """
-
-    raise NotImplementedError("split_overflow 尚未实现")
+    batches = build_batches(sprites, max_vertices)
+    return {"batches": batches, "overflow": []}
 
 
 def batch_frames(
@@ -145,5 +286,28 @@ def batch_frames(
     ``BatchError``，不产生部分输出。空 ``frames`` 返回
     ``{"frames": [], "draws": 0}``；浮点比较使用 ``1e-6`` 容差。
     """
+    _validate_max_vertices(max_vertices)
+    if isinstance(frames, (str, bytes)) or not isinstance(frames, Sequence):
+        raise BatchError(f"frames 必须是序列: {type(frames).__name__}")
 
-    raise NotImplementedError("batch_frames 尚未实现")
+    # 第一阶段：完整校验所有帧，任何非法都直接抛错，不产生部分输出。
+    for frame_index, frame in enumerate(frames):
+        if isinstance(frame, (str, bytes)) or not isinstance(frame, Sequence):
+            raise BatchError(f"帧 {frame_index} 不是序列: {frame!r}")
+        _validate_sprites(frame)
+        for sprite_index, sprite in enumerate(frame):
+            if sprite["verts"] > max_vertices:
+                raise BatchError(
+                    f"帧 {frame_index} 精灵 {sprite_index} 的 "
+                    f"verts={sprite['verts']} 超过上限 {max_vertices}"
+                )
+
+    # 第二阶段：全部合法后才生成结果。
+    results = []
+    total_draws = 0
+    for frame in frames:
+        batches = build_batches(frame, max_vertices)
+        draws = estimate_draws(batches)
+        results.append({"batches": batches, "draws": draws})
+        total_draws += draws
+    return {"frames": results, "draws": total_draws}
